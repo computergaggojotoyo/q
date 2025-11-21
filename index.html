@@ -1,178 +1,169 @@
 <!doctype html>
 <html lang="ko">
 <head>
-<meta charset="utf-8">
-<title>2옥타브 웹 피아노</title>
-<style>
-  body { font-family:sans-serif; padding:20px; }
-  #piano { display:flex; position:relative; }
-  .white {
-    width:60px; height:220px;
-    background:white; border:1px solid #555;
-    margin:1px; box-sizing:border-box;
-    position:relative;
-    text-align:center; line-height:200px;
-    cursor:pointer; border-radius:4px;
-  }
-  .white.active { background:#cfe3ff; }
-  .black {
-    width:40px; height:140px;
-    background:black; color:white;
-    position:absolute; top:0; z-index:2;
-    border-radius:4px;
-    text-align:center; line-height:120px;
-    cursor:pointer;
-  }
-  .black.active { background:#444; }
-</style>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>수면 감지 — Teachable Machine</title>
+  <style>
+    body { font-family:"Noto Sans KR", sans-serif; margin:0; padding:20px; background:#f5f5f5; }
+    h2 { margin-bottom:8px; }
+    video { width:100%; max-width:420px; background:black; border-radius:8px; }
+    #overlay {
+      position:fixed; bottom:20px; right:20px;
+      background:rgba(0,0,0,0.85); color:white;
+      padding:14px 18px; border-radius:10px; font-size:18px;
+      display:none; z-index:9999;
+    }
+    button { padding:8px 14px; border-radius:8px; border:1px solid #ccc; cursor:pointer; }
+    button.primary { background:#1c6bff; color:white; border:none; }
+    #errorBox {
+      background:#ffe3e3; color:#c20000; padding:12px;
+      border-radius:10px; margin:10px 0; display:none;
+    }
+  </style>
+
+  <!-- TensorFlow.js -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.21.0"></script>
 </head>
+
 <body>
+  <h2>Teachable Machine – Class 1 감지 알림</h2>
+  <p style="font-size:13px;color:#444">
+    도움 사이트: <a href="https://gptonline.ai/ko/" target="_blank">gptonline.ai/ko</a>
+  </p>
 
-<h2>2옥타브 브라우저 피아노 (Shift = 반음)</h2>
-<p>⚠️ 처음 사용할 때 화면을 한 번 클릭해야 소리가 활성화됩니다.</p>
+  <div id="errorBox"></div>
 
-<div id="piano"></div>
+  <video id="webcam" autoplay playsinline muted></video>
+
+  <div style="margin-top:10px;">
+    <button id="startBtn" class="primary">Start</button>
+    <button id="stopBtn" disabled>Stop</button>
+  </div>
+
+  <p id="status" style="margin-top:10px;color:#333;">대기 중…</p>
+
+  <div id="overlay">자고 있다</div>
 
 <script>
-/* ---------------------------
-   오디오 초기화
----------------------------- */
-const AudioContext = window.AudioContext || window.webkitAudioContext;
-const ctx = new AudioContext();
-let unlocked = false;
-function unlock() {
-  if (!unlocked) {
-    ctx.resume();
-    unlocked = true;
+const MODEL_URL = "https://teachablemachine.withgoogle.com/models/dw7EhEr_3/";
+let model = null, metadata = null, class1Index = null;
+let stream = null, running = false, rafId = null;
+let lastAlert = 0;
+const COOLDOWN = 4000;
+
+const video = document.getElementById("webcam");
+const startBtn = document.getElementById("startBtn");
+const stopBtn = document.getElementById("stopBtn");
+const errorBox = document.getElementById("errorBox");
+const statusEl = document.getElementById("status");
+const overlay = document.getElementById("overlay");
+
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+function beep() {
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.connect(g); g.connect(audioCtx.destination);
+  o.frequency.value = 700; o.type = "sine";
+  g.gain.setValueAtTime(0.0001, audioCtx.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.3, audioCtx.currentTime + 0.02);
+  o.start();
+  g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.3);
+  o.stop(audioCtx.currentTime + 0.32);
+}
+
+function showError(msg){
+  errorBox.style.display = "block";
+  errorBox.innerText = msg;
+}
+
+async function loadModel() {
+  statusEl.innerText = "모델 로딩 중…";
+  model = await tf.loadGraphModel(MODEL_URL + "model.json");
+
+  const md = await fetch(MODEL_URL + "metadata.json");
+  metadata = await md.json();
+
+  class1Index = metadata.labels.indexOf("Class 1");
+  statusEl.innerText = "모델 로딩 완료";
+}
+
+async function startCamera() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video:true });
+    video.srcObject = stream;
+    await video.play();
+  } catch (err) {
+    showError("카메라 접근 실패: 브라우저 주소창 오른쪽의 권한 설정에서 카메라를 허용해주세요.");
+    throw err;
   }
 }
-document.body.addEventListener("click", unlock);
 
-/* ---------------------------
-   음계 설정
-   C4(60) ~ B5(83)  → 총 24음
----------------------------- */
-function midiToFreq(m) {
-  return 440 * Math.pow(2, (m - 69) / 12);
-}
-function playNote(midi) {
-  const osc = ctx.createOscillator();
-  const gain = ctx.createGain();
-
-  osc.type = "sine";
-  osc.frequency.value = midiToFreq(midi);
-  osc.connect(gain);
-  gain.connect(ctx.destination);
-
-  gain.gain.setValueAtTime(0.001, ctx.currentTime);
-  gain.gain.exponentialRampToValueAtTime(0.8, ctx.currentTime + 0.02);
-  gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
-
-  osc.start();
-  osc.stop(ctx.currentTime + 0.45);
+function alertSleeping(prob){
+  overlay.innerText = `자고 있다 (${(prob*100).toFixed(1)}%)`;
+  overlay.style.display = "block";
+  beep();
+  setTimeout(()=> overlay.style.display="none", 2500);
 }
 
-/* ---------------------------
-   키 매핑
----------------------------- */
-// 흰 건반 (24개)
-const whiteKeys = [
-  "z","x","c","v","b","n","m",",",".","/","a","s","d","f","g","h","j","k","l",";","'"
-];
+async function loop() {
+  if (!running) return;
 
-// C4~B5 : MIDI 60~83 중 흰건반만 추출
-const whiteMidi = [
-  60,62,64,65,67,69,71, // Z~/
-  72,74,76,77,79,81,83  // A~'
-];
+  const size = 224;
+  const img = tf.browser.fromPixels(video).resizeNearestNeighbor([size, size]).toFloat().expandDims(0).div(255);
+  const pred = model.predict(img);
+  const data = await pred.data();
+  img.dispose(); pred.dispose();
 
-// 검은 건반 (#) → 5개씩 x 2옥타브 = 10개
-// 1~0 - = 키들 매핑
-const blackKeys = ["1","2","3","4","5","6","7","8","9","0","-","="];
+  const p = data[class1Index] ?? 0;
+  statusEl.innerText = `Class 1 확률: ${(p*100).toFixed(1)}%`;
 
-// C#4~A#5 (총 10개)
-const blackMidi = [
-  61,63,66,68,70, // 1~5
-  73,75,78,80,82  // 6~0
-];
+  const now = Date.now();
+  if (p > 0.8 && now - lastAlert > COOLDOWN) {
+    lastAlert = now;
+    alertSleeping(p);
+  }
 
-/* ---------------------------
-   UI 건반 생성
----------------------------- */
-
-const piano = document.getElementById("piano");
-
-// 흰건반 생성
-whiteMidi.forEach((midi,i)=>{
-  const key = document.createElement("div");
-  key.className = "white";
-  key.dataset.key = whiteKeys[i] || "";
-  key.dataset.midi = midi;
-  key.textContent = (whiteKeys[i]||"").toUpperCase();
-  piano.appendChild(key);
-});
-
-// 검은건반 위치 계산 (흰건반 사이)
-const whiteEls = document.querySelectorAll(".white");
-const blackOffsets = [0,1,3,4,5]; // C#,D#,F#,G#,A#
-
-let blackIndex = 0;
-for (let oct=0; oct<2; oct++) {
-  blackOffsets.forEach(offset=>{
-    const idx = offset + oct*7;
-    const white = whiteEls[idx];
-    if (!white) return;
-
-    const b = document.createElement("div");
-    b.className = "black";
-    b.dataset.key = blackKeys[blackIndex] || "";
-    b.dataset.midi = blackMidi[blackIndex];
-    b.textContent = blackKeys[blackIndex].toUpperCase();
-
-    // 위치 설정
-    b.style.left = (white.offsetLeft + 40) + "px";
-
-    piano.appendChild(b);
-    blackIndex++;
-  });
+  rafId = requestAnimationFrame(loop);
 }
 
-/* ---------------------------
-   이벤트: 마우스
----------------------------- */
+startBtn.onclick = async () => {
+  startBtn.disabled = true;
+  errorBox.style.display = "none";
 
-function pressKey(el, shiftMode=false) {
-  unlock();
-  let midi = Number(el.dataset.midi);
-  if (shiftMode) midi += 1;   // Shift로 반음 증가
-  playNote(midi);
-  el.classList.add("active");
-  setTimeout(()=>el.classList.remove("active"),150);
-}
+  if (audioCtx.state === "suspended") await audioCtx.resume();
 
-piano.addEventListener("mousedown", e=>{
-  const key = e.target.closest(".white, .black");
-  if(!key) return;
-  pressKey(key, e.shiftKey);
-});
+  try {
+    await loadModel();
+    await startCamera();
+  } catch (e) {
+    startBtn.disabled = false;
+    return;
+  }
 
-/* ---------------------------
-   이벤트: 키보드
----------------------------- */
+  running = true;
+  stopBtn.disabled = false;
+  loop();
+};
 
-function findElement(key) {
-  return [...document.querySelectorAll(".white,.black")]
-    .find(el=>el.dataset.key === key);
-}
+stopBtn.onclick = () => {
+  running = false;
+  stopBtn.disabled = true;
+  startBtn.disabled = false;
 
-window.addEventListener("keydown", e=>{
-  if (e.repeat) return;
-  const k = e.key.toLowerCase();
-  const el = findElement(k);
-  if (!el) return;
-  pressKey(el, e.shiftKey);
-});
+  if (rafId) cancelAnimationFrame(rafId);
+
+  if (stream) {
+    stream.getTracks().forEach(t => t.stop());
+    stream = null;
+  }
+
+  statusEl.innerText = "정지됨";
+};
 </script>
 
+<p style="margin-top:20px; font-size:12px; color:#555;">
+  더 많은 도구: <a href="https://gptonline.ai/ko/" target="_blank">gptonline.ai/ko</a>
+</p>
 </body>
 </html>
